@@ -1,3 +1,4 @@
+import hmac
 import hkdf
 import hashlib
 
@@ -33,9 +34,12 @@ class TlsHash:
             secret, label, self.hashmod(messages).digest(), self.hash_len
         )
 
+    def transcript_hash(self, *msgs):
+        return self.hashmod(b"".join(msgs)).digest()
+
     # def transcript_hash(self, client_hello_data, *others):
     #     digest = self.hashmod(client_hello_data).digest()
-    #     return self.hashmode(
+    #     return self.hashmod(
     #         b"\xfe\x00\x00"
     #         + self.hash_len.to_bytes(1, "big")
     #         + digest
@@ -47,6 +51,14 @@ class TlsHash:
 
     def derive_iv(self, secret, iv_length):
         return self.hkdf_expand_label(secret, b"iv", b"", iv_length)
+
+    def finished_key(self, base_key):
+        return self.hkdf_expand_label(base_key, b"finished", b"", self.hash_len)
+
+    def verify_data(self, secret, msg):
+        return hmac.new(
+            self.finished_key(secret), self.transcript_hash(msg), self.hashmod
+        ).digest()
 
     def scheduler(self, ecdhe, psk=None):
         return KeyScheduler(self, ecdhe, psk)

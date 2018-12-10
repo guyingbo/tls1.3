@@ -1,4 +1,6 @@
 import os
+import struct
+import random
 import socket
 import iofree
 import ciphers
@@ -6,10 +8,6 @@ from enum import IntEnum
 from types import SimpleNamespace
 from nacl.public import PrivateKey
 from nacl.bindings import crypto_scalarmult
-
-# from cryptography.hazmat.backends import default_backend
-# from cryptography.hazmat.primitives.asymmetric import dh
-# from cryptography.hazmat.primitives.serialization import PublicFormat, Encoding
 
 
 class Alert(Exception):
@@ -51,50 +49,37 @@ class HandshakeType(UInt8Enum):
     def pack_data(self, data: bytes) -> bytes:
         return self.pack() + pack_int(3, data)
 
-    @classmethod
-    def unpack_from(cls, mv: memoryview):
-        handshakes = []
-        while mv:
-            handshake_type = mv[0]
-            length = int.from_bytes(mv[1:4], "big")
-            # assert (
-            #     len(mv[4:]) == length
-            # ), f"handshake length (should be {length}) does not match: {bytes(mv[4:])}"
-            handshake_data = mv[4 : 4 + length]
-            if handshake_type == cls.server_hello:
-                handshakes.append(unpack_server_hello(handshake_data))
-            elif handshake_type == cls.encrypted_extensions:
-                handshakes.append(ExtensionType.unpack_from(handshake_data))
-            elif handshake_type == cls.certificate:
-                handshakes.append((cls.certificate, bytes(handshake_data)))
-            elif handshake_type == cls.certificate_verify:
-                handshakes.append((cls.certificate_verify, bytes(handshake_data)))
-            elif handshake_type == cls.finished:
-                handshakes.append((cls.finished, bytes(handshake_data)))
-            else:
-                raise Exception(f"unknown handshake type {handshake_type}")
-            mv = mv[4 + length :]
-        return handshakes
+    def tls_inner_plaintext(self, content: bytes) -> bytes:
+        return (
+            self.pack_data(content)
+            + ContentType.handshake.pack()
+            + (b"\x00" * random.randint(0, 10))
+        )
 
 
-def unpack_server_hello(mv: memoryview):
-    assert mv[:2] == b"\x03\x03", "version must be 0x0303"
-    random = bytes(mv[2:34])
-    legacy_session_id_echo_length = mv[34]
-    legacy_session_id_echo = bytes(mv[35 : 35 + legacy_session_id_echo_length])
-    mv = mv[35 + legacy_session_id_echo_length :]
-    print(bytes(mv[:2]))
-    cipher_suite = CipherSuite.get_cipher(mv[:2])
-    assert mv[2] == 0, "legacy_compression_method should be 0"
-    extension_length = int.from_bytes(mv[3:5], "big")
-    extensions_mv = mv[5:]
-    assert len(extensions_mv) == extension_length, "extensions length does not match"
-    extensions = ExtensionType.unpack_from(extensions_mv)
+def unpack_certificate_verify(mv):
+    algorithm = int.from_bytes(mv[:2], "big")
+    scheme = SignatureScheme.from_value(algorithm)
+    signature_len = int.from_bytes(mv[2:4], "big")
+    signature = mv[4 : 4 + signature_len]
+    return SimpleNamespace(algorithm=scheme, signature=signature)
+
+
+def unpack_new_session_ticket(mv):
+    lifetime, age_add, nonce_len = struct.unpack_from("!IIB", mv)
+    mv = mv[9:]
+    nonce = bytes(mv[:nonce_len])
+    mv = mv[nonce_len:]
+    ticket_len = int.from_bytes(mv[:2], "big")
+    mv = mv[2:]
+    ticket = bytes(mv[:ticket_len])
+    mv = mv[ticket_len:]
+    extensions = ExtensionType.unpack_from(mv)
     return SimpleNamespace(
-        handshake_type=HandshakeType.server_hello,
-        random=random,
-        legacy_session_id_echo=legacy_session_id_echo,
-        cipher_suite=cipher_suite,
+        lifetime=lifetime,
+        age_add=age_add,
+        nonce=nonce,
+        ticket=ticket,
         extensions=extensions,
     )
 
@@ -216,23 +201,13 @@ class ContentType(UInt8Enum):
             )
         )
 
-    def tls_inner_plaintext(self, cipher, data: bytes) -> bytes:
-        assert len(data) > 0, "need data"
-        return b"".join(
-            (
-                data,
-                self.pack(),
-                (cipher.block_size - (len(data) % cipher.block_size)) * b"\x00",
-            )
-        )
+    def tls_inner_plaintext(self, content: bytes) -> bytes:
+        return content + self.pack() + (b"\x00" * random.randint(0, 10))
 
 
 class AlertLevel(UInt8Enum):
     warning = 1
     fatal = 2
-
-    def alert(self, description) -> bytes:
-        return self.pack() + description.pack()
 
 
 class AlertDescription(UInt8Enum):
@@ -361,6 +336,40 @@ class CertificateType(UInt8Enum):
     RawPublicKey = 2
 
 
+class CertificateEntry:
+    __slots__ = ("cert_type", "cert_data", "extensions")
+
+    def __init__(self, cert_type, cert_data, extensions):
+        self.cert_type = cert_type
+        self.cert_data = cert_data
+        self.extensions = extensions
+
+    def __repr__(self):
+        return f"{self.__class__.__name__}(type={self.cert_type!r},extensions={self.extensions})"
+
+    @classmethod
+    def unpack_from(cls, data):
+        certificate_request_context_len = data[0]
+        certificate_request_context = data[1 : 1 + certificate_request_context_len]
+        certificate_request_context
+        data = data[1 + certificate_request_context_len :]
+        certificate_list_len = int.from_bytes(data[:3], "big")
+        certificate_list = data[3 : 3 + certificate_list_len]
+        assert (
+            len(data[3 + certificate_list_len :]) == 0
+        ), "Certificate length does not match"
+        cert_type = CertificateType.from_value(certificate_list[0])
+        cert_data_len = int.from_bytes(certificate_list[1:4], "big")
+        cert_data = certificate_list[4 : 4 + cert_data_len]
+        extensions_data = certificate_list[4 + cert_data_len :]
+        extensions_len = int.from_bytes(extensions_data[:2], "big")
+        extensions = extensions_data[2 : 2 + extensions_len]
+        assert (
+            len(extensions_data[2 + extensions_len :]) == 0
+        ), "extensions length does not match"
+        return cls(cert_type, cert_data, extensions)
+
+
 class KeyUpdateRequest(UInt8Enum):
     update_not_requested = 0
     update_requested = 1
@@ -405,7 +414,7 @@ class CipherSuite(UInt16Enum):
         elif value == cls.TLS_CHACHA20_POLY1305_SHA256:
             return ciphers.TLS_CHACHA20_POLY1305_SHA256
         else:
-            raise Exception("cipher suite wrong")
+            raise Exception("bad cipher suite")
 
     @classmethod
     def pack_all(cls):
@@ -496,85 +505,204 @@ def server_hello_pack(legacy_session_id_echo, cipher_suite, extensions) -> bytes
     )
 
 
-def application_data_pack(data) -> bytes:
-    return ContentType.application_data.tls_inner_plaintext()
-
-
-def tls_ciphertext(cipher, data):
-    encrypt = cipher.make_encryptor()
-    ciphertext = encrypt(data)
-    return b"".join(
-        (ContentType.application_data.pack(), b"\x03\x03", pack_int(2, ciphertext))
-    )
-
-
 def key_share_client_hello_pack(*key_share_entries):
     return ExtensionType.key_share.pack_data(pack_list(2, key_share_entries))
 
 
+def client_pre_shared_key_pack(identities, binders):
+    return b"".join(identities) + b"".join(binders)
+
+
+def _PskIdentity(identity: bytes, obfuscated_ticket_age: int):
+    return pack_int(2, identity) + obfuscated_ticket_age.to_bytes(4, "big")
+
+
+def _PskBinderEntry(data: bytes):
+    return pack_int(1, data)
+
+
+class TLSClient:
+    def __init__(self):
+        self.private_key, key_share_entry = NamedGroup.new_x25519()
+        self.client_hello_data = client_hello_pack(
+            [
+                ExtensionType.server_name_list("127.0.0.1"),
+                # ExtensionType.server_name_list("localhost"),
+                ExtensionType.supported_versions_list(),
+                Const.all_signature_algorithms,
+                Const.all_supported_groups,
+                key_share_client_hello_pack(key_share_entry),
+            ]
+        )
+        self.handshake_context = [self.client_hello_data]
+        self.server_finished = False
+
+    def unpack_server_hello(self, mv: memoryview):
+        assert mv[:2] == b"\x03\x03", "version must be 0x0303"
+        random = bytes(mv[2:34])
+        legacy_session_id_echo_length = mv[34]
+        legacy_session_id_echo = bytes(mv[35 : 35 + legacy_session_id_echo_length])
+        mv = mv[35 + legacy_session_id_echo_length :]
+        cipher_suite = CipherSuite.get_cipher(mv[:2])
+        assert mv[2] == 0, "legacy_compression_method should be 0"
+        extension_length = int.from_bytes(mv[3:5], "big")
+        extensions_mv = mv[5:]
+        assert (
+            len(extensions_mv) == extension_length
+        ), "extensions length does not match"
+        extensions = ExtensionType.unpack_from(extensions_mv)
+        return SimpleNamespace(
+            handshake_type=HandshakeType.server_hello,
+            random=random,
+            legacy_session_id_echo=legacy_session_id_echo,
+            cipher_suite=cipher_suite,
+            extensions=extensions,
+        )
+
+    def unpack_handshake(self, mv: memoryview):
+        handshake_type = mv[0]
+        length = int.from_bytes(mv[1:4], "big")
+        assert len(mv[4:]) == length, f"handshake length does not match"
+        handshake_data = mv[4:]
+        if handshake_type == HandshakeType.server_hello:
+            self.handshake_context.append(mv)
+            return self.unpack_server_hello(handshake_data)
+        elif handshake_type == HandshakeType.encrypted_extensions:
+            self.handshake_context.append(mv)
+            self.encrypted_extensions = ExtensionType.unpack_from(handshake_data)
+        elif handshake_type == HandshakeType.certificate_request:
+            self.handshake_context.append(mv)
+        elif handshake_type == HandshakeType.certificate:
+            self.handshake_context.append(mv)
+            self.certificate_entry = CertificateEntry.unpack_from(handshake_data)
+        elif handshake_type == HandshakeType.certificate_verify:
+            self.handshake_context.append(mv)
+            self.certificate_verify = unpack_certificate_verify(handshake_data)
+        elif handshake_type == HandshakeType.finished:
+            context = b"".join(self.handshake_context)
+            assert handshake_data == self.peer_cipher.verify_data(
+                context
+            ), "server handshake finished does not match"
+            self.handshake_context.append(mv)
+            self.server_finished = True
+        elif handshake_type == HandshakeType.new_session_ticket:
+            self.session_ticket = unpack_new_session_ticket(mv)
+        else:
+            raise Exception(f"unknown handshake type {handshake_type}")
+
+    def get_context(self):
+        return b"".join(self.handshake_context)
+
+    def tls_response(self):
+        while True:
+            head = yield from iofree.read(5)
+            assert head[1:3] == b"\x03\x03", f"bad legacy_record_version {head[1:3]}"
+            length = int.from_bytes(head[3:], "big")
+            content = memoryview((yield from iofree.read(length)))
+            if head[0] == ContentType.alert:
+                level = AlertLevel.from_value(content[0])
+                description = AlertDescription.from_value(content[1])
+                raise Alert(level, description)
+            elif head[0] == ContentType.handshake:
+                self.peer_handshake = self.unpack_handshake(content)
+                assert (
+                    self.peer_handshake.handshake_type == HandshakeType.server_hello
+                ), "expect server hello"
+                peer_pk = self.peer_handshake.extensions[
+                    ExtensionType.key_share
+                ].key_exchange
+                shared_key = crypto_scalarmult(bytes(self.private_key), peer_pk)
+                TLSCipher = self.peer_handshake.cipher_suite
+                key_scheduler = TLSCipher.tls_hash.scheduler(shared_key)
+                secret = key_scheduler.server_handshake_traffic_secret(
+                    self.get_context()
+                )
+                # server handshake cipher
+                self.peer_cipher = TLSCipher(secret)
+                client_handshake_traffic_secret = key_scheduler.client_handshake_traffic_secret(
+                    self.get_context()
+                )
+            elif head[0] == ContentType.application_data:
+                plaintext = self.peer_cipher.decrypt(content, head).rstrip(b"\x00")
+                content_type = ContentType.from_value(plaintext[-1])
+                if content_type == ContentType.handshake:
+                    self.unpack_handshake(plaintext[:-1])
+                    if self.server_finished:
+                        # client handshake cipher
+                        self.cipher = TLSCipher(client_handshake_traffic_secret)
+                        context = b"".join(self.handshake_context)
+                        client_finished = self.cipher.verify_data(context)
+                        inner_plaintext = HandshakeType.finished.tls_inner_plaintext(
+                            client_finished
+                        )
+                        record = self.cipher.tls_ciphertext(inner_plaintext)
+                        change_cipher_spec = ContentType.change_cipher_spec.tls_plaintext(
+                            b"\x01"
+                        )
+                        yield from iofree.write(change_cipher_spec + record)
+                        # server application cipher
+                        server_secret = key_scheduler.server_application_traffic_secret_0(
+                            self.get_context()
+                        )
+                        self.peer_cipher = TLSCipher(server_secret)
+                        self.server_finished = False
+
+                        # client application cipher
+                        client_secret = key_scheduler.client_application_traffic_secret_0(
+                            self.get_context()
+                        )
+                        self.cipher = TLSCipher(client_secret)
+
+                elif content_type == ContentType.application_data:
+                    yield from iofree.write(plaintext[:-1])
+                elif content_type == ContentType.alert:
+                    level = AlertLevel.from_value(plaintext[0])
+                    description = AlertDescription.from_value(plaintext[1])
+                    raise Alert(level, description)
+                elif content_type == ContentType.invalid:
+                    raise Exception("invalid content type")
+                else:
+                    raise Exception(f"unexpected content type {content_type}")
+            elif head[0] == ContentType.change_cipher_spec:
+                assert content == b"\x01", "change_cipher should be 0x01"
+            else:
+                raise Exception(f"Unknown content type: {head[0]}")
+
+    def pack_application_data(self, payload: bytes):
+        inner_plaintext = ContentType.application_data.tls_inner_plaintext(payload)
+        return self.cipher.tls_ciphertext(inner_plaintext)
+
+    def pack_alert(self, description: AlertDescription, warning: bool = True):
+        level = AlertLevel.warning if warning else AlertLevel.fatal
+        payload = level.pack() + description.pack()
+        inner_plaintext = ContentType.alert.tls_inner_plaintext(payload)
+        return self.cipher.tls_ciphertext(inner_plaintext)
+
+
+client = TLSClient()
+
+
 sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
 sock.connect(("127.0.0.1", 1799))
-private_key, key_share_entry = NamedGroup.new_x25519()
-client_hello_data = client_hello_pack(
-    [
-        ExtensionType.server_name_list("127.0.0.1"),
-        # ExtensionType.server_name_list("localhost"),
-        ExtensionType.supported_versions_list(),
-        Const.all_signature_algorithms,
-        Const.all_supported_groups,
-        key_share_client_hello_pack(key_share_entry),
-    ]
-)
-
-sock.sendall(ContentType.handshake.tls_plaintext(client_hello_data))
+sock.sendall(ContentType.handshake.tls_plaintext(client.client_hello_data))
 server_data = sock.recv(4096)
 
-
-@iofree.parser
-def tls_response(private_key):
-    records = []
-    while True:
-        head = yield from iofree.read(5)
-        assert head[1:3] == b"\x03\x03", f"bad legacy_record_version {head[1:3]}"
-        length = int.from_bytes(head[3:], "big")
-        content = memoryview((yield from iofree.read(length)))
-        if head[0] == ContentType.alert:
-            raise
-        elif head[0] == ContentType.handshake:
-            handshake = HandshakeType.unpack_from(content)[0]
-            assert (
-                handshake.handshake_type == HandshakeType.server_hello
-            ), "expect server hello"
-            peer_pk = handshake.extensions[ExtensionType.key_share].key_exchange
-            shared_key = crypto_scalarmult(bytes(private_key), peer_pk)
-            TLSCipher = handshake.cipher_suite
-            key_scheduler = TLSCipher.tls_hash.scheduler(shared_key)
-            secret = key_scheduler.server_handshake_traffic_secret(
-                client_hello_data + content
-            )
-            aead = TLSCipher(secret)
-        elif head[0] == ContentType.application_data:
-            plaintext = aead.decrypt(content, head).rstrip(b"\x00")
-            content_type = ContentType.from_value(plaintext[-1])
-            if content_type == ContentType.handshake:
-                handshakes = HandshakeType.unpack_from(plaintext[:-1])
-                records.append(handshakes)
-            else:
-                raise "TODO"
-        elif head[0] == ContentType.change_cipher_spec:
-            pass
-            # print('change_cipher', bytes(content))
-        else:
-            raise Exception(f"Unknown content type: {head[0]}")
-        if not (yield from iofree.has_more_data()):
-            return records
-
-
-parser = tls_response.parser(private_key)
+parser = iofree.Parser(client.tls_response())
 parser.send(server_data)
-assert parser.has_result
-records = parser.get_result()
-# sock.sendall(b"")
-for record in records:
-    print(record)
+sock.sendall(parser.read())
+sock.sendall(client.pack_application_data(b"ping\n"))
+server_data = sock.recv(4096)
+parser.send(server_data)
+
+server_data = sock.recv(4096)
+parser.send(server_data)
+
+for i in range(3):
+    server_data = sock.recv(4096)
+    parser.send(server_data)
+    data = parser.read()
+    print(data)
+
+
+sock.sendall(client.pack_alert(AlertDescription.close_notify))
 sock.close()
