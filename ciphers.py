@@ -128,6 +128,8 @@ class TLS_AES_128_CCM_SHA256(TLS_AEAD_Cipher):
 
 class TLS_AES_128_CCM_8_SHA256(TLS_AEAD_Cipher):
     tls_hash = tls_sha256
+    KEY_LEN = 16
+    MAC_LEN = 8
 
     def cipher(self):
         return AES.new(

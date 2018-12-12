@@ -429,10 +429,11 @@ class CipherSuite(UInt16Enum):
         return pack_all(
             2,
             [
+                cls.TLS_CHACHA20_POLY1305_SHA256,
                 cls.TLS_AES_128_GCM_SHA256,
                 cls.TLS_AES_256_GCM_SHA384,
                 cls.TLS_AES_128_CCM_SHA256,
-                cls.TLS_CHACHA20_POLY1305_SHA256,
+                cls.TLS_AES_128_CCM_8_SHA256,
             ],
         )
 
