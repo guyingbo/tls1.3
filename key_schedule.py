@@ -68,21 +68,10 @@ tls_sha256 = TlsHash()
 tls_sha384 = TlsHash(hashlib.sha384)
 
 
-class KeyScheduler:
-    def __init__(self, tls_hash, ecdhe, psk=None):
+class PSKWrapper:
+    def __init__(self, psk, tls_hash=tls_sha256):
         self.tls_hash = tls_hash
-        self.ecdhe = ecdhe
-        self.psk = psk
-
-        self.early_secret = self.tls_hash.hkdf_extract(None, self.psk)
-        self.first_salt = self.tls_hash.derive_secret(
-            self.early_secret, b"derived", b""
-        )
-        self.handshake_secret = self.tls_hash.hkdf_extract(self.first_salt, self.ecdhe)
-        self.second_salt = self.tls_hash.derive_secret(
-            self.handshake_secret, b"derived", b""
-        )
-        self.master_secret = self.tls_hash.hkdf_extract(self.second_salt, None)
+        self.early_secret = self.tls_hash.hkdf_extract(None, psk)
 
     def ext_binder_key(self):
         return self.tls_hash.derive_secret(self.early_secret, b"ext binder", b"")
@@ -95,6 +84,22 @@ class KeyScheduler:
 
     def early_exporter_master_secret(self, messages):
         return self.tls_hash.derive_secret(self.early_secret, b"e exp master", messages)
+
+
+class KeyScheduler:
+    def __init__(self, tls_hash, ecdhe, psk=None):
+        self.tls_hash = tls_hash
+        self.ecdhe = ecdhe
+
+        self.early_secret = self.tls_hash.hkdf_extract(None, psk)
+        self.first_salt = self.tls_hash.derive_secret(
+            self.early_secret, b"derived", b""
+        )
+        self.handshake_secret = self.tls_hash.hkdf_extract(self.first_salt, self.ecdhe)
+        self.second_salt = self.tls_hash.derive_secret(
+            self.handshake_secret, b"derived", b""
+        )
+        self.master_secret = self.tls_hash.hkdf_extract(self.second_salt, None)
 
     def client_handshake_traffic_secret(self, messages):
         return self.tls_hash.derive_secret(

@@ -4,10 +4,12 @@ import random
 import socket
 import iofree
 import ciphers
+from collections import namedtuple
 from enum import IntEnum
 from types import SimpleNamespace
 from nacl.public import PrivateKey
 from nacl.bindings import crypto_scalarmult
+from key_schedule import PSKWrapper
 
 
 class Alert(Exception):
@@ -166,6 +168,9 @@ class ExtensionType(UInt16Enum):
             return NamedGroup.unpack_from(data)
         if self == ExtensionType.server_name:
             return data.decode()
+        if self == ExtensionType.pre_shared_key:
+            assert len(data) == 2, "invalid length"
+            return int.from_bytes(data, "big")
         raise Exception("not support yet")
 
 
@@ -379,6 +384,9 @@ class PskKeyExchangeMode(UInt8Enum):
     psk_ke = 0
     psk_dhe_ke = 1
 
+    def extension(self):
+        return ExtensionType.psk_key_exchange_modes.pack_data(pack_int(1, self.pack()))
+
 
 class CipherSuite(UInt16Enum):
     TLS_AES_128_GCM_SHA256 = 0x1301
@@ -455,38 +463,8 @@ class Const:
     all_supported_groups = ExtensionType.supported_groups.pack_data(
         pack_all(2, [NamedGroup.x25519])
     )
-
-
-def client_hello_pack(
-    extensions, cipher_suites=None, compatibility_mode=True, retry=False
-):
-    legacy_version = b"\x03\x03"
-    if compatibility_mode:
-        legacy_session_id = os.urandom(32)
-    else:
-        legacy_session_id = b""
-    if cipher_suites is None:
-        cipher_suites = CipherSuite.pack_all()
-    else:
-        cipher_suites = pack_list(
-            2, (cipher_suite.pack() for cipher_suite in cipher_suites)
-        )
-    assert 0 < len(cipher_suites) < 32768, "cipher_suites<2..2^16-2>"
-    randbytes = bytes.fromhex(
-        "CF21AD74E59A6111BE1D8C021E65B891C2A211167ABB8C5E079E09E2C8A8339C"
-    )
-
-    msg = b"".join(
-        (
-            legacy_version,
-            randbytes if retry else os.urandom(32),
-            pack_int(1, legacy_session_id),
-            cipher_suites,
-            b"\x01\x00",  # legacy_compression_methods
-            pack_list(2, extensions),
-        )
-    )
-    return HandshakeType.client_hello.pack_data(msg)
+    psk_ke_extension = PskKeyExchangeMode.psk_ke.extension()
+    psk_dhe_ke_extension = PskKeyExchangeMode.psk_dhe_ke.extension()
 
 
 def server_hello_pack(legacy_session_id_echo, cipher_suite, extensions) -> bytes:
@@ -505,12 +483,28 @@ def server_hello_pack(legacy_session_id_echo, cipher_suite, extensions) -> bytes
     )
 
 
-def key_share_client_hello_pack(*key_share_entries):
+def client_hello_key_share_extension(*key_share_entries):
     return ExtensionType.key_share.pack_data(pack_list(2, key_share_entries))
 
 
-def client_pre_shared_key_pack(identities, binders):
-    return b"".join(identities) + b"".join(binders)
+PskIdentity = namedtuple("PskIdentity", ["identity", "age", "binder"])
+
+
+def client_pre_shared_key_extension(*psk_identities):
+    binders = pack_list(2, (pack_int(1, i.binder) for i in psk_identities))
+    return (
+        ExtensionType.pre_shared_key.pack_data(
+            pack_list(
+                2,
+                (
+                    pack_int(2, i.identity) + i.age.to_bytes(4, "big")
+                    for i in psk_identities
+                ),
+            )
+            + binders
+        ),
+        len(binders),
+    )
 
 
 def _PskIdentity(identity: bytes, obfuscated_ticket_age: int):
@@ -522,20 +516,72 @@ def _PskBinderEntry(data: bytes):
 
 
 class TLSClient:
-    def __init__(self):
+    def __init__(self, server_names="", psk=None, psk_only=False):
+        if type(server_names) == str:
+            server_names = [server_names]
         self.private_key, key_share_entry = NamedGroup.new_x25519()
-        self.client_hello_data = client_hello_pack(
-            [
-                ExtensionType.server_name_list("127.0.0.1"),
-                # ExtensionType.server_name_list("localhost"),
-                ExtensionType.supported_versions_list(),
-                Const.all_signature_algorithms,
-                Const.all_supported_groups,
-                key_share_client_hello_pack(key_share_entry),
-            ]
-        )
-        self.handshake_context = [self.client_hello_data]
+        extensions = [
+            ExtensionType.server_name_list(*server_names),
+            ExtensionType.supported_versions_list(),
+            Const.all_signature_algorithms,
+            Const.all_supported_groups,
+            client_hello_key_share_extension(key_share_entry),
+        ]
+        if psk is not None:
+            if psk_only:
+                pre_kex_mode_ext = Const.psk_ke_extension
+            else:
+                pre_kex_mode_ext = Const.psk_dhe_ke_extension
+            extensions.append(pre_kex_mode_ext)
+            psk_wrapper = PSKWrapper(psk)
+            ext, binder_length = client_pre_shared_key_extension(
+                PskIdentity(
+                    b"ClientIdentity", 0, b"\x00" * psk_wrapper.tls_hash.hash_len
+                )
+            )
+            extensions.append(ext)
+        self.psk = psk
+        self.client_hello_data = self.pack_client_hello(extensions)
+        if psk is not None:
+            self.client_hello_data = self.client_hello_data[
+                : -psk_wrapper.tls_hash.hash_len
+            ] + psk_wrapper.tls_hash.verify_data(
+                psk_wrapper.ext_binder_key(), self.client_hello_data[:-binder_length]
+            )
+        self.handshake_context = bytearray(self.client_hello_data)
+        # print(self.client_hello_data)
         self.server_finished = False
+
+    def pack_client_hello(
+        self, extensions, cipher_suites=None, compatibility_mode=True, retry=False
+    ):
+        legacy_version = b"\x03\x03"
+        if compatibility_mode:
+            legacy_session_id = os.urandom(32)
+        else:
+            legacy_session_id = b""
+        if cipher_suites is None:
+            cipher_suites = CipherSuite.pack_all()
+        else:
+            cipher_suites = pack_list(
+                2, (cipher_suite.pack() for cipher_suite in cipher_suites)
+            )
+        assert 0 < len(cipher_suites) < 32768, "cipher_suites<2..2^16-2>"
+        randbytes = bytes.fromhex(
+            "CF21AD74E59A6111BE1D8C021E65B891C2A211167ABB8C5E079E09E2C8A8339C"
+        )
+
+        msg = b"".join(
+            (
+                legacy_version,
+                randbytes if retry else os.urandom(32),
+                pack_int(1, legacy_session_id),
+                cipher_suites,
+                b"\x01\x00",  # legacy_compression_methods
+                pack_list(2, extensions),
+            )
+        )
+        return HandshakeType.client_hello.pack_data(msg)
 
     def unpack_server_hello(self, mv: memoryview):
         assert mv[:2] == b"\x03\x03", "version must be 0x0303"
@@ -565,33 +611,29 @@ class TLSClient:
         assert len(mv[4:]) == length, f"handshake length does not match"
         handshake_data = mv[4:]
         if handshake_type == HandshakeType.server_hello:
-            self.handshake_context.append(mv)
+            self.handshake_context.extend(mv)
             return self.unpack_server_hello(handshake_data)
         elif handshake_type == HandshakeType.encrypted_extensions:
-            self.handshake_context.append(mv)
+            self.handshake_context.extend(mv)
             self.encrypted_extensions = ExtensionType.unpack_from(handshake_data)
         elif handshake_type == HandshakeType.certificate_request:
-            self.handshake_context.append(mv)
+            self.handshake_context.extend(mv)
         elif handshake_type == HandshakeType.certificate:
-            self.handshake_context.append(mv)
+            self.handshake_context.extend(mv)
             self.certificate_entry = CertificateEntry.unpack_from(handshake_data)
         elif handshake_type == HandshakeType.certificate_verify:
-            self.handshake_context.append(mv)
+            self.handshake_context.extend(mv)
             self.certificate_verify = unpack_certificate_verify(handshake_data)
         elif handshake_type == HandshakeType.finished:
-            context = b"".join(self.handshake_context)
             assert handshake_data == self.peer_cipher.verify_data(
-                context
+                self.handshake_context
             ), "server handshake finished does not match"
-            self.handshake_context.append(mv)
+            self.handshake_context.extend(mv)
             self.server_finished = True
         elif handshake_type == HandshakeType.new_session_ticket:
             self.session_ticket = unpack_new_session_ticket(mv)
         else:
             raise Exception(f"unknown handshake type {handshake_type}")
-
-    def get_context(self):
-        return b"".join(self.handshake_context)
 
     def tls_response(self):
         while True:
@@ -613,14 +655,14 @@ class TLSClient:
                 ].key_exchange
                 shared_key = crypto_scalarmult(bytes(self.private_key), peer_pk)
                 TLSCipher = self.peer_handshake.cipher_suite
-                key_scheduler = TLSCipher.tls_hash.scheduler(shared_key)
+                key_scheduler = TLSCipher.tls_hash.scheduler(shared_key, self.psk)
                 secret = key_scheduler.server_handshake_traffic_secret(
-                    self.get_context()
+                    self.handshake_context
                 )
                 # server handshake cipher
                 self.peer_cipher = TLSCipher(secret)
                 client_handshake_traffic_secret = key_scheduler.client_handshake_traffic_secret(
-                    self.get_context()
+                    self.handshake_context
                 )
             elif head[0] == ContentType.application_data:
                 plaintext = self.peer_cipher.decrypt(content, head).rstrip(b"\x00")
@@ -630,8 +672,9 @@ class TLSClient:
                     if self.server_finished:
                         # client handshake cipher
                         self.cipher = TLSCipher(client_handshake_traffic_secret)
-                        context = b"".join(self.handshake_context)
-                        client_finished = self.cipher.verify_data(context)
+                        client_finished = self.cipher.verify_data(
+                            self.handshake_context
+                        )
                         inner_plaintext = HandshakeType.finished.tls_inner_plaintext(
                             client_finished
                         )
@@ -642,14 +685,14 @@ class TLSClient:
                         yield from iofree.write(change_cipher_spec + record)
                         # server application cipher
                         server_secret = key_scheduler.server_application_traffic_secret_0(
-                            self.get_context()
+                            self.handshake_context
                         )
                         self.peer_cipher = TLSCipher(server_secret)
                         self.server_finished = False
 
                         # client application cipher
                         client_secret = key_scheduler.client_application_traffic_secret_0(
-                            self.get_context()
+                            self.handshake_context
                         )
                         self.cipher = TLSCipher(client_secret)
 
@@ -679,7 +722,8 @@ class TLSClient:
         return self.cipher.tls_ciphertext(inner_plaintext)
 
 
-client = TLSClient()
+psk = bytes.fromhex("b2c9b9f57ef2fbbba8b624070b301d7f278f1b39c352d5fa849f85a3e7a3f77b")
+client = TLSClient(psk=psk)
 
 
 sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
