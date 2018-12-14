@@ -1,7 +1,6 @@
 import os
 import struct
 import random
-import socket
 import iofree
 import ciphers
 from collections import namedtuple
@@ -12,8 +11,22 @@ from nacl.bindings import crypto_scalarmult
 from key_schedule import PSKWrapper
 
 
+def pack_int(length: int, data: bytes) -> bytes:
+    return len(data).to_bytes(length, "big") + data
+
+
+def pack_list(length: int, iterable) -> bytes:
+    return pack_int(length, b"".join(data for data in iterable))
+
+
+def pack_all(length: int, iterable) -> bytes:
+    return pack_int(length, b"".join(obj.pack() for obj in iterable))
+
+
 class Alert(Exception):
-    ""
+    def __init__(self, level, description):
+        self.level = level
+        self.description = description
 
 
 class MyIntEnum(IntEnum):
@@ -59,33 +72,6 @@ class HandshakeType(UInt8Enum):
         )
 
 
-def unpack_certificate_verify(mv):
-    algorithm = int.from_bytes(mv[:2], "big")
-    scheme = SignatureScheme.from_value(algorithm)
-    signature_len = int.from_bytes(mv[2:4], "big")
-    signature = mv[4 : 4 + signature_len]
-    return SimpleNamespace(algorithm=scheme, signature=signature)
-
-
-def unpack_new_session_ticket(mv):
-    lifetime, age_add, nonce_len = struct.unpack_from("!IIB", mv)
-    mv = mv[9:]
-    nonce = bytes(mv[:nonce_len])
-    mv = mv[nonce_len:]
-    ticket_len = int.from_bytes(mv[:2], "big")
-    mv = mv[2:]
-    ticket = bytes(mv[:ticket_len])
-    mv = mv[ticket_len:]
-    extensions = ExtensionType.unpack_from(mv)
-    return SimpleNamespace(
-        lifetime=lifetime,
-        age_add=age_add,
-        nonce=nonce,
-        ticket=ticket,
-        extensions=extensions,
-    )
-
-
 class ExtensionType(UInt16Enum):
     server_name = 0
     max_fragment_length = 1
@@ -114,14 +100,10 @@ class ExtensionType(UInt16Enum):
         return self.pack() + pack_int(2, data)
 
     @classmethod
-    def server_name_list(cls, host_name: str, *host_names: str) -> bytes:
+    def server_name_list(cls, host_names: list) -> bytes:
         return cls.server_name.pack_data(
             pack_list(
-                2,
-                (
-                    NameType.host_name.pack_data(name.encode())
-                    for name in (host_name, *host_names)
-                ),
+                2, (NameType.host_name.pack_data(name.encode()) for name in host_names)
             )
         )
 
@@ -445,18 +427,6 @@ class NameType(UInt8Enum):
         return self.pack() + pack_int(2, data)
 
 
-def pack_int(length: int, data: bytes) -> bytes:
-    return len(data).to_bytes(length, "big") + data
-
-
-def pack_list(length: int, iterable) -> bytes:
-    return pack_int(length, b"".join(data for data in iterable))
-
-
-def pack_all(length: int, iterable) -> bytes:
-    return pack_int(length, b"".join(obj.pack() for obj in iterable))
-
-
 class Const:
     all_signature_algorithms = ExtensionType.signature_algorithms.pack_data(
         pack_all(2, SignatureScheme)
@@ -491,8 +461,9 @@ def client_hello_key_share_extension(*key_share_entries):
 PskIdentity = namedtuple("PskIdentity", ["identity", "age", "binder"])
 
 
-def client_pre_shared_key_extension(*psk_identities):
-    binders = pack_list(2, (pack_int(1, i.binder) for i in psk_identities))
+def client_pre_shared_key_extension(psk_identities):
+    # binders = pack_list(2, (pack_int(1, i.binder) for i in psk_identities))
+    binders = pack_psk_binder_entries((i.binder for i in psk_identities))
     return (
         ExtensionType.pre_shared_key.pack_data(
             pack_list(
@@ -508,21 +479,51 @@ def client_pre_shared_key_extension(*psk_identities):
     )
 
 
-def _PskIdentity(identity: bytes, obfuscated_ticket_age: int):
-    return pack_int(2, identity) + obfuscated_ticket_age.to_bytes(4, "big")
+def pack_psk_binder_entries(binder_list):
+    return pack_list(2, (pack_int(1, binder) for binder in binder_list))
 
 
-def _PskBinderEntry(data: bytes):
-    return pack_int(1, data)
+def unpack_certificate_verify(mv):
+    algorithm = int.from_bytes(mv[:2], "big")
+    scheme = SignatureScheme.from_value(algorithm)
+    signature_len = int.from_bytes(mv[2:4], "big")
+    signature = mv[4 : 4 + signature_len]
+    return SimpleNamespace(algorithm=scheme, signature=signature)
+
+
+def unpack_new_session_ticket(mv):
+    lifetime, age_add, nonce_len = struct.unpack_from("!IIB", mv)
+    mv = mv[9:]
+    nonce = bytes(mv[:nonce_len])
+    mv = mv[nonce_len:]
+    ticket_len = int.from_bytes(mv[:2], "big")
+    mv = mv[2:]
+    ticket = bytes(mv[:ticket_len])
+    mv = mv[ticket_len:]
+    extensions = ExtensionType.unpack_from(mv)
+    return SimpleNamespace(
+        lifetime=lifetime,
+        age_add=age_add,
+        nonce=nonce,
+        ticket=ticket,
+        extensions=extensions,
+    )
 
 
 class TLSClient:
-    def __init__(self, server_names="", psk=None, psk_only=False):
+    def __init__(
+        self,
+        server_names="",
+        psk=None,
+        psk_only=False,
+        psk_label=b"Client_identity",
+        data_callback=None,
+    ):
         if type(server_names) == str:
             server_names = [server_names]
         self.private_key, key_share_entry = NamedGroup.new_x25519()
         extensions = [
-            ExtensionType.server_name_list(*server_names),
+            ExtensionType.server_name_list(server_names),
             ExtensionType.supported_versions_list(),
             Const.all_signature_algorithms,
             Const.all_supported_groups,
@@ -534,26 +535,31 @@ class TLSClient:
             else:
                 pre_kex_mode_ext = Const.psk_dhe_ke_extension
             extensions.append(pre_kex_mode_ext)
-            psk_wrapper = PSKWrapper(psk)
+            self.psk_list = psk if isinstance(psk, (list, tuple)) else [psk]
+            psk_wrappers = [PSKWrapper(psk) for psk in self.psk_list]
             ext, binder_length = client_pre_shared_key_extension(
-                PskIdentity(
-                    b"ClientIdentity", 0, b"\x00" * psk_wrapper.tls_hash.hash_len
-                )
+                [
+                    PskIdentity(psk_label, 0, b"\x00" * psk_wrapper.tls_hash.hash_len)
+                    for psk_wrapper in psk_wrappers
+                ]
             )
             extensions.append(ext)
-        self.psk = psk
-        self.client_hello_data = self.pack_client_hello(extensions)
+        self.client_hello_data = self._pack_client_hello(extensions)
         if psk is not None:
-            self.client_hello_data = self.client_hello_data[
-                : -psk_wrapper.tls_hash.hash_len
-            ] + psk_wrapper.tls_hash.verify_data(
-                psk_wrapper.ext_binder_key(), self.client_hello_data[:-binder_length]
+            to_verify = self.client_hello_data[:-binder_length]
+            self.client_hello_data = to_verify + pack_psk_binder_entries(
+                (
+                    psk_wrapper.tls_hash.verify_data(
+                        psk_wrapper.ext_binder_key(), to_verify
+                    )
+                    for psk_wrapper in psk_wrappers
+                )
             )
         self.handshake_context = bytearray(self.client_hello_data)
-        # print(self.client_hello_data)
         self.server_finished = False
+        self.data_callback = data_callback or (lambda data: None)
 
-    def pack_client_hello(
+    def _pack_client_hello(
         self, extensions, cipher_suites=None, compatibility_mode=True, retry=False
     ):
         legacy_version = b"\x03\x03"
@@ -641,6 +647,13 @@ class TLSClient:
             head = yield from iofree.read(5)
             assert head[1:3] == b"\x03\x03", f"bad legacy_record_version {head[1:3]}"
             length = int.from_bytes(head[3:], "big")
+            if (head[0] == ContentType.application_data and length > (16384 + 256)) or (
+                head[0] != ContentType.application_data and length > 16384
+            ):
+                yield from iofree.write(
+                    self.pack_fatal(AlertDescription.record_overflow)
+                )
+                raise Alert(AlertLevel.fatal, AlertDescription.record_overflow)
             content = memoryview((yield from iofree.read(length)))
             if head[0] == ContentType.alert:
                 level = AlertLevel.from_value(content[0])
@@ -656,7 +669,11 @@ class TLSClient:
                 ].key_exchange
                 shared_key = crypto_scalarmult(bytes(self.private_key), peer_pk)
                 TLSCipher = self.peer_handshake.cipher_suite
-                key_scheduler = TLSCipher.tls_hash.scheduler(shared_key, self.psk)
+                key_index = self.peer_handshake.extensions.get(
+                    ExtensionType.pre_shared_key
+                )
+                psk = None if key_index is None else self.psk_list[key_index]
+                key_scheduler = TLSCipher.tls_hash.scheduler(shared_key, psk)
                 secret = key_scheduler.server_handshake_traffic_secret(
                     self.handshake_context
                 )
@@ -672,14 +689,12 @@ class TLSClient:
                     self.unpack_handshake(plaintext[:-1])
                     if self.server_finished:
                         # client handshake cipher
-                        self.cipher = TLSCipher(client_handshake_traffic_secret)
-                        client_finished = self.cipher.verify_data(
-                            self.handshake_context
-                        )
+                        cipher = TLSCipher(client_handshake_traffic_secret)
+                        client_finished = cipher.verify_data(self.handshake_context)
                         inner_plaintext = HandshakeType.finished.tls_inner_plaintext(
                             client_finished
                         )
-                        record = self.cipher.tls_ciphertext(inner_plaintext)
+                        record = cipher.tls_ciphertext(inner_plaintext)
                         change_cipher_spec = ContentType.change_cipher_spec.tls_plaintext(
                             b"\x01"
                         )
@@ -698,7 +713,7 @@ class TLSClient:
                         self.cipher = TLSCipher(client_secret)
 
                 elif content_type == ContentType.application_data:
-                    yield from iofree.write(plaintext[:-1])
+                    self.data_callback(plaintext[:-1])
                 elif content_type == ContentType.alert:
                     level = AlertLevel.from_value(plaintext[0])
                     description = AlertDescription.from_value(plaintext[1])
@@ -712,42 +727,32 @@ class TLSClient:
             else:
                 raise Exception(f"Unknown content type: {head[0]}")
 
+    def pack_client_hello(self):
+        return ContentType.handshake.tls_plaintext(self.client_hello_data)
+
     def pack_application_data(self, payload: bytes):
         inner_plaintext = ContentType.application_data.tls_inner_plaintext(payload)
         return self.cipher.tls_ciphertext(inner_plaintext)
 
-    def pack_alert(self, description: AlertDescription, warning: bool = True):
-        level = AlertLevel.warning if warning else AlertLevel.fatal
+    def pack_alert(self, description: AlertDescription, level: AlertLevel):
         payload = level.pack() + description.pack()
-        inner_plaintext = ContentType.alert.tls_inner_plaintext(payload)
-        return self.cipher.tls_ciphertext(inner_plaintext)
+        if self.cipher:
+            inner_plaintext = ContentType.alert.tls_inner_plaintext(payload)
+            return self.cipher.tls_ciphertext(inner_plaintext)
+        else:
+            return ContentType.alert.tls_plaintext(payload)
 
+    def pack_warning(self, description: AlertDescription):
+        return self.pack_alert(description, AlertLevel.warning)
 
-psk = bytes.fromhex("b2c9b9f57ef2fbbba8b624070b301d7f278f1b39c352d5fa849f85a3e7a3f77b")
-client = TLSClient(psk=psk)
+    def pack_fatal(self, description: AlertDescription):
+        return self.pack_alert(description, AlertLevel.fatal)
 
+    def pack_close(self):
+        return self.pack_warning(AlertDescription.close_notify)
 
-sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-sock.connect(("127.0.0.1", 1799))
-sock.sendall(ContentType.handshake.tls_plaintext(client.client_hello_data))
-server_data = sock.recv(4096)
+    def pack_canceled(self):
+        return self.pack_warning(AlertDescription.user_canceled)
 
-parser = iofree.Parser(client.tls_response())
-parser.send(server_data)
-sock.sendall(parser.read())
-sock.sendall(client.pack_application_data(b"ping\n"))
-server_data = sock.recv(4096)
-parser.send(server_data)
-
-server_data = sock.recv(4096)
-parser.send(server_data)
-
-for i in range(3):
-    server_data = sock.recv(4096)
-    parser.send(server_data)
-    data = parser.read()
-    print(data)
-
-
-sock.sendall(client.pack_alert(AlertDescription.close_notify))
-sock.close()
+    def parser(self):
+        return iofree.Parser(self.tls_response())
