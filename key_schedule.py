@@ -69,15 +69,19 @@ tls_sha384 = TlsHash(hashlib.sha384)
 
 
 class PSKWrapper:
-    def __init__(self, psk, tls_hash=tls_sha256):
+    def __init__(self, psk, tls_hash=tls_sha256, is_ext=True):
         self.tls_hash = tls_hash
         self.early_secret = self.tls_hash.hkdf_extract(None, psk)
+        self.is_ext = is_ext
 
     def ext_binder_key(self):
         return self.tls_hash.derive_secret(self.early_secret, b"ext binder", b"")
 
     def res_binder_key(self):
         return self.tls_hash.derive_secret(self.early_secret, b"res binder", b"")
+
+    def binder_key(self):
+        return self.ext_binder_key() if self.is_ext else self.res_binder_key()
 
     def client_early_traffic_secret(self, messages):
         return self.tls_hash.derive_secret(self.early_secret, b"c e traffic", messages)
@@ -126,3 +130,9 @@ class KeyScheduler:
 
     def resumption_master_secret(self, messages):
         return self.tls_hash.derive_secret(self.master_secret, b"res master", messages)
+
+    def resumption_psk(self, messages, ticket_nonce):
+        secret = self.resumption_master_secret(messages)
+        return self.tls_hash.hkdf_expand_label(
+            secret, b"resumption", ticket_nonce, self.tls_hash.hash_len
+        )

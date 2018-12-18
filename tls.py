@@ -1,14 +1,18 @@
 import os
+import time
 import struct
 import random
 import iofree
 import ciphers
-from collections import namedtuple
+from dataclasses import dataclass
 from enum import IntEnum
 from types import SimpleNamespace
 from nacl.public import PrivateKey
 from nacl.bindings import crypto_scalarmult
 from key_schedule import PSKWrapper
+
+MAX_LIFETIME = 24 * 3600 * 7
+AGE_MOD = 2 ** 32
 
 
 def pack_int(length: int, data: bytes) -> bytes:
@@ -458,18 +462,21 @@ def client_hello_key_share_extension(*key_share_entries):
     return ExtensionType.key_share.pack_data(pack_list(2, key_share_entries))
 
 
-PskIdentity = namedtuple("PskIdentity", ["identity", "age", "binder"])
+@dataclass
+class PskIdentity:
+    identity: bytes
+    obfuscated_ticket_age: int
+    binder_len: int
 
 
 def client_pre_shared_key_extension(psk_identities):
-    # binders = pack_list(2, (pack_int(1, i.binder) for i in psk_identities))
-    binders = pack_psk_binder_entries((i.binder for i in psk_identities))
+    binders = pack_psk_binder_entries((i.binder_len * b"\x00" for i in psk_identities))
     return (
         ExtensionType.pre_shared_key.pack_data(
             pack_list(
                 2,
                 (
-                    pack_int(2, i.identity) + i.age.to_bytes(4, "big")
+                    pack_int(2, i.identity) + i.obfuscated_ticket_age.to_bytes(4, "big")
                     for i in psk_identities
                 ),
             )
@@ -494,14 +501,14 @@ def unpack_certificate_verify(mv):
 def unpack_new_session_ticket(mv):
     lifetime, age_add, nonce_len = struct.unpack_from("!IIB", mv)
     mv = mv[9:]
-    nonce = bytes(mv[:nonce_len])
+    nonce = mv[:nonce_len]
     mv = mv[nonce_len:]
     ticket_len = int.from_bytes(mv[:2], "big")
     mv = mv[2:]
     ticket = bytes(mv[:ticket_len])
     mv = mv[ticket_len:]
     extensions = ExtensionType.unpack_from(mv)
-    return SimpleNamespace(
+    return NewSessionTicket(
         lifetime=lifetime,
         age_add=age_add,
         nonce=nonce,
@@ -510,17 +517,38 @@ def unpack_new_session_ticket(mv):
     )
 
 
-class TLSClient:
+@dataclass
+class NewSessionTicket:
+    lifetime: int
+    age_add: int
+    nonce: bytes
+    ticket: bytes
+    extensions: dict
+
+    def __post_init__(self):
+        self.outdated_time = time.time() + min(self.lifetime, MAX_LIFETIME)
+        self.obfuscated_ticket_age = ((self.lifetime * 1000) + self.age_add) % AGE_MOD
+
+    def is_outdated(self):
+        return time.time() >= self.outdated_time
+
+    def to_psk_identity(self, binder_len):
+        return PskIdentity(self.ticket, self.obfuscated_ticket_age, binder_len)
+
+
+class TLSClientSession:
     def __init__(
         self,
         server_names="",
         psk=None,
         psk_only=False,
         psk_label=b"Client_identity",
+        psk_identities=None,
         data_callback=None,
     ):
         if type(server_names) == str:
             server_names = [server_names]
+        self.server_names = server_names
         self.private_key, key_share_entry = NamedGroup.new_x25519()
         extensions = [
             ExtensionType.server_name_list(server_names),
@@ -536,10 +564,14 @@ class TLSClient:
                 pre_kex_mode_ext = Const.psk_dhe_ke_extension
             extensions.append(pre_kex_mode_ext)
             self.psk_list = psk if isinstance(psk, (list, tuple)) else [psk]
-            psk_wrappers = [PSKWrapper(psk) for psk in self.psk_list]
+            psk_wrappers = [
+                PSKWrapper(psk, is_ext=psk_identities is None) for psk in self.psk_list
+            ]
             ext, binder_length = client_pre_shared_key_extension(
-                [
-                    PskIdentity(psk_label, 0, b"\x00" * psk_wrapper.tls_hash.hash_len)
+                psk_identities
+                if psk_identities
+                else [
+                    PskIdentity(psk_label, 0, psk_wrapper.tls_hash.hash_len)
                     for psk_wrapper in psk_wrappers
                 ]
             )
@@ -547,17 +579,41 @@ class TLSClient:
         self.client_hello_data = self._pack_client_hello(extensions)
         if psk is not None:
             to_verify = self.client_hello_data[:-binder_length]
-            self.client_hello_data = to_verify + pack_psk_binder_entries(
-                (
+            binders = pack_psk_binder_entries(
+                [
                     psk_wrapper.tls_hash.verify_data(
-                        psk_wrapper.ext_binder_key(), to_verify
+                        psk_wrapper.binder_key(), to_verify
                     )
                     for psk_wrapper in psk_wrappers
-                )
+                ]
             )
+            self.client_hello_data = to_verify + binders
         self.handshake_context = bytearray(self.client_hello_data)
         self.server_finished = False
         self.data_callback = data_callback or (lambda data: None)
+        self.session_tickets = []
+
+    def resumption(self, data_callback=None):
+        if self.session_tickets:
+            psk = [
+                self.key_scheduler.resumption_psk(
+                    self.handshake_context, session_ticket.nonce
+                )
+                for session_ticket in self.session_tickets
+            ]
+            psk_identities = [
+                session_ticket.to_psk_identity(self.TLSCipher.tls_hash.hash_len)
+                for session_ticket in self.session_tickets
+            ]
+        else:
+            psk = self.psk
+            psk_identities = None
+        return TLSClientSession(
+            self.server_names,
+            psk=psk,
+            psk_identities=psk_identities,
+            data_callback=data_callback,
+        )
 
     def _pack_client_hello(
         self, extensions, cipher_suites=None, compatibility_mode=True, retry=False
@@ -638,7 +694,8 @@ class TLSClient:
             self.handshake_context.extend(mv)
             self.server_finished = True
         elif handshake_type == HandshakeType.new_session_ticket:
-            self.session_ticket = unpack_new_session_ticket(mv)
+            # self.session_tickets.append(unpack_new_session_ticket(handshake_data))
+            self.session_tickets = [unpack_new_session_ticket(handshake_data)]
         else:
             raise Exception(f"unknown handshake type {handshake_type}")
 
@@ -669,11 +726,13 @@ class TLSClient:
                 ].key_exchange
                 shared_key = crypto_scalarmult(bytes(self.private_key), peer_pk)
                 TLSCipher = self.peer_handshake.cipher_suite
+                self.TLSCipher = TLSCipher
                 key_index = self.peer_handshake.extensions.get(
                     ExtensionType.pre_shared_key
                 )
                 psk = None if key_index is None else self.psk_list[key_index]
                 key_scheduler = TLSCipher.tls_hash.scheduler(shared_key, psk)
+                self.key_scheduler = key_scheduler
                 secret = key_scheduler.server_handshake_traffic_secret(
                     self.handshake_context
                 )
@@ -691,8 +750,11 @@ class TLSClient:
                         # client handshake cipher
                         cipher = TLSCipher(client_handshake_traffic_secret)
                         client_finished = cipher.verify_data(self.handshake_context)
-                        inner_plaintext = HandshakeType.finished.tls_inner_plaintext(
+                        client_finished_data = HandshakeType.finished.pack_data(
                             client_finished
+                        )
+                        inner_plaintext = ContentType.handshake.tls_inner_plaintext(
+                            client_finished_data
                         )
                         record = cipher.tls_ciphertext(inner_plaintext)
                         change_cipher_spec = ContentType.change_cipher_spec.tls_plaintext(
@@ -711,7 +773,7 @@ class TLSClient:
                             self.handshake_context
                         )
                         self.cipher = TLSCipher(client_secret)
-
+                        self.handshake_context.extend(client_finished_data)
                 elif content_type == ContentType.application_data:
                     self.data_callback(plaintext[:-1])
                 elif content_type == ContentType.alert:
