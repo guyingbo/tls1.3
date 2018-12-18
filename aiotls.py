@@ -49,6 +49,7 @@ async def main():
     )
     for i in range(3):
         data = await client.reader.read(65536)
+        client.write(data)
         print(data)
     client.close()
     await client.wait_closed()

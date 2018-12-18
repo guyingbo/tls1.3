@@ -15,8 +15,8 @@ def main():
     psk = bytes.fromhex(
         "b2c9b9f57ef2fbbba8b624070b301d7f278f1b39c352d5fa849f85a3e7a3f77b"
     )
-    # session = TLSClientSession(psk=psk, data_callback=callback)
-    session = TLSClientSession(data_callback=callback)
+    session = TLSClientSession(server_names="127.0.0.1", psk=psk, data_callback=callback)
+    # session = TLSClientSession(server_names="127.0.0.1", data_callback=callback)
 
     sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     sock.connect(("127.0.0.1", 1799))

@@ -131,7 +131,7 @@ class ExtensionType(UInt16Enum):
     def unpack_from(cls, mv):
         extensions = {}
         while mv:
-            value = int.from_bytes(mv[:2], "big")
+            type_value = int.from_bytes(mv[:2], "big")
             mv = mv[2:]
             if mv:
                 extension_data_lenth = int.from_bytes(mv[:2], "big")
@@ -143,7 +143,7 @@ class ExtensionType(UInt16Enum):
                 mv = mv[pos:]
             else:
                 extension_data = b""
-            et = cls.from_value(value)
+            et = cls.from_value(type_value)
             extensions[et] = et.unpack(extension_data)
         return extensions
 
@@ -157,6 +157,8 @@ class ExtensionType(UInt16Enum):
         if self == ExtensionType.pre_shared_key:
             assert len(data) == 2, "invalid length"
             return int.from_bytes(data, "big")
+        if self == ExtensionType.early_data:
+            return bytes(data)
         raise Exception("not support yet")
 
 
@@ -373,6 +375,10 @@ class PskKeyExchangeMode(UInt8Enum):
     def extension(self):
         return ExtensionType.psk_key_exchange_modes.pack_data(pack_int(1, self.pack()))
 
+    @classmethod
+    def both_extensions(cls):
+        return ExtensionType.psk_key_exchange_modes.pack_data(pack_int(1, b"\x00\x01"))
+
 
 class CipherSuite(UInt16Enum):
     TLS_AES_128_GCM_SHA256 = 0x1301
@@ -440,6 +446,7 @@ class Const:
     )
     psk_ke_extension = PskKeyExchangeMode.psk_ke.extension()
     psk_dhe_ke_extension = PskKeyExchangeMode.psk_dhe_ke.extension()
+    psk_both_extensions = PskKeyExchangeMode.both_extensions()
 
 
 def server_hello_pack(legacy_session_id_echo, cipher_suite, extensions) -> bytes:
@@ -507,6 +514,9 @@ def unpack_new_session_ticket(mv):
     mv = mv[2:]
     ticket = bytes(mv[:ticket_len])
     mv = mv[ticket_len:]
+    ext_len = int.from_bytes(mv[:2], "big")
+    mv = mv[2:]
+    assert ext_len == len(mv), "extension length does not match"
     extensions = ExtensionType.unpack_from(mv)
     return NewSessionTicket(
         lifetime=lifetime,
@@ -545,11 +555,18 @@ class TLSClientSession:
         psk_label=b"Client_identity",
         psk_identities=None,
         data_callback=None,
+        early_data=None,
     ):
         if type(server_names) == str:
             server_names = [server_names]
         self.server_names = server_names
         self.private_key, key_share_entry = NamedGroup.new_x25519()
+        self.early_data = early_data
+        self.server_finished = False
+        self.data_callback = data_callback or (lambda data: None)
+        self.session_tickets = []
+        self.psk_only = psk_only or bool(early_data)
+
         extensions = [
             ExtensionType.server_name_list(server_names),
             ExtensionType.supported_versions_list(),
@@ -557,8 +574,12 @@ class TLSClientSession:
             Const.all_supported_groups,
             client_hello_key_share_extension(key_share_entry),
         ]
+        if early_data:
+            if psk is None:
+                raise Exception("early data should only send with psk support")
+            extensions.insert(0, ExtensionType.early_data.pack_data(b""))
         if psk is not None:
-            if psk_only:
+            if self.psk_only:
                 pre_kex_mode_ext = Const.psk_ke_extension
             else:
                 pre_kex_mode_ext = Const.psk_dhe_ke_extension
@@ -589,9 +610,18 @@ class TLSClientSession:
             )
             self.client_hello_data = to_verify + binders
         self.handshake_context = bytearray(self.client_hello_data)
-        self.server_finished = False
-        self.data_callback = data_callback or (lambda data: None)
-        self.session_tickets = []
+
+        if early_data:
+            TLSCipher = ciphers.TLS_CHACHA20_POLY1305_SHA256
+            psk_wrapper = psk_wrappers[0]
+            cipher = TLSCipher(
+                psk_wrapper.client_early_traffic_secret(self.handshake_context)
+            )
+
+            inner_plaintext = ContentType.application_data.tls_inner_plaintext(
+                self.early_data
+            )
+            self.packed_early_data = cipher.tls_ciphertext(inner_plaintext)
 
     def resumption(self, data_callback=None):
         if self.session_tickets:
@@ -611,6 +641,7 @@ class TLSClientSession:
         return TLSClientSession(
             self.server_names,
             psk=psk,
+            psk_only=self.psk_only,
             psk_identities=psk_identities,
             data_callback=data_callback,
         )
@@ -678,6 +709,11 @@ class TLSClientSession:
             return self.unpack_server_hello(handshake_data)
         elif handshake_type == HandshakeType.encrypted_extensions:
             self.handshake_context.extend(mv)
+            ext_len = int.from_bytes(handshake_data[:2], "big")
+            handshake_data = handshake_data[2:]
+            assert (
+                len(handshake_data) == ext_len
+            ), "encrypted extensions length does not match"
             self.encrypted_extensions = ExtensionType.unpack_from(handshake_data)
         elif handshake_type == HandshakeType.certificate_request:
             self.handshake_context.extend(mv)
@@ -694,8 +730,7 @@ class TLSClientSession:
             self.handshake_context.extend(mv)
             self.server_finished = True
         elif handshake_type == HandshakeType.new_session_ticket:
-            # self.session_tickets.append(unpack_new_session_ticket(handshake_data))
-            self.session_tickets = [unpack_new_session_ticket(handshake_data)]
+            self.session_tickets.append(unpack_new_session_ticket(handshake_data))
         else:
             raise Exception(f"unknown handshake type {handshake_type}")
 
@@ -790,7 +825,8 @@ class TLSClientSession:
                 raise Exception(f"Unknown content type: {head[0]}")
 
     def pack_client_hello(self):
-        return ContentType.handshake.tls_plaintext(self.client_hello_data)
+        data = ContentType.handshake.tls_plaintext(self.client_hello_data)
+        return data if not self.early_data else data + self.packed_early_data
 
     def pack_application_data(self, payload: bytes):
         inner_plaintext = ContentType.application_data.tls_inner_plaintext(payload)
