@@ -9,7 +9,7 @@ debug with openssl 1.1 or above:
 /usr/local/opt/openssl@1.1/bin/openssl s_client -connect 127.0.0.1:1799 -tls1_3 -debug -keylogfile keylog.txt -msg -state -tlsextdebug
 ~~~
 
-## Supported Features
+## Current Supported Features
 
 #### Implementations
 
@@ -45,6 +45,7 @@ debug with openssl 1.1 or above:
 
 #### Others
 
+* session resumption ✓
 * early data ✓
 * cookie x
 * oid filters x
