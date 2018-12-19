@@ -3,28 +3,17 @@ import time
 import struct
 import random
 import iofree
-import ciphers
 from dataclasses import dataclass
 from enum import IntEnum
 from types import SimpleNamespace
 from nacl.public import PrivateKey
 from nacl.bindings import crypto_scalarmult
-from key_schedule import PSKWrapper
+from . import ciphers
+from .key_schedule import PSKWrapper
+from .utils import pack_int, pack_list, pack_all
 
 MAX_LIFETIME = 24 * 3600 * 7
 AGE_MOD = 2 ** 32
-
-
-def pack_int(length: int, data: bytes) -> bytes:
-    return len(data).to_bytes(length, "big") + data
-
-
-def pack_list(length: int, iterable) -> bytes:
-    return pack_int(length, b"".join(data for data in iterable))
-
-
-def pack_all(length: int, iterable) -> bytes:
-    return pack_int(length, b"".join(obj.pack() for obj in iterable))
 
 
 class Alert(Exception):
@@ -158,7 +147,10 @@ class ExtensionType(UInt16Enum):
             assert len(data) == 2, "invalid length"
             return int.from_bytes(data, "big")
         if self == ExtensionType.early_data:
-            return bytes(data)
+            if data:
+                assert len(data) == 4, "expect uint32 max_early_data_size"
+                return int.from_bytes(data, "big")
+            return
         raise Exception("not support yet")
 
 
@@ -310,15 +302,11 @@ class NamedGroup(UInt16Enum):
         return KeyShareEntry(group_type, key_exchange)
 
 
+@dataclass
 class KeyShareEntry:
+    group: NamedGroup
+    key_exchange: bytes
     __slots__ = ("group", "key_exchange")
-
-    def __init__(self, group, key_exchange):
-        self.group = group
-        self.key_exchange = key_exchange
-
-    def __repr__(self):
-        return f"{self.__class__.__name__}(group={self.group!r},key_exchange={self.key_exchange})"
 
     def pack(self):
         return self.group.pack() + pack_int(2, self.key_exchange)
@@ -329,16 +317,12 @@ class CertificateType(UInt8Enum):
     RawPublicKey = 2
 
 
+@dataclass
 class CertificateEntry:
+    cert_type: CertificateType
+    cert_data: bytes
+    extensions: dict
     __slots__ = ("cert_type", "cert_data", "extensions")
-
-    def __init__(self, cert_type, cert_data, extensions):
-        self.cert_type = cert_type
-        self.cert_data = cert_data
-        self.extensions = extensions
-
-    def __repr__(self):
-        return f"{self.__class__.__name__}(type={self.cert_type!r},extensions={self.extensions})"
 
     @classmethod
     def unpack_from(cls, data):
@@ -356,7 +340,7 @@ class CertificateEntry:
         cert_data = certificate_list[4 : 4 + cert_data_len]
         extensions_data = certificate_list[4 + cert_data_len :]
         extensions_len = int.from_bytes(extensions_data[:2], "big")
-        extensions = extensions_data[2 : 2 + extensions_len]
+        extensions = ExtensionType.unpack_from(extensions_data[2 : 2 + extensions_len])
         assert (
             len(extensions_data[2 + extensions_len :]) == 0
         ), "extensions length does not match"
@@ -523,7 +507,7 @@ def unpack_new_session_ticket(mv):
         age_add=age_add,
         nonce=nonce,
         ticket=ticket,
-        extensions=extensions,
+        max_early_data_size=extensions.get(ExtensionType.early_data),
     )
 
 
@@ -533,7 +517,7 @@ class NewSessionTicket:
     age_add: int
     nonce: bytes
     ticket: bytes
-    extensions: dict
+    max_early_data_size: int
 
     def __post_init__(self):
         self.outdated_time = time.time() + min(self.lifetime, MAX_LIFETIME)
@@ -577,7 +561,7 @@ class TLSClientSession:
         if early_data:
             if psk is None:
                 raise Exception("early data should only send with psk support")
-            extensions.insert(0, ExtensionType.early_data.pack_data(b""))
+            extensions.insert(4, ExtensionType.early_data.pack_data(b""))
         if psk is not None:
             if self.psk_only:
                 pre_kex_mode_ext = Const.psk_ke_extension
@@ -614,14 +598,15 @@ class TLSClientSession:
         if early_data:
             TLSCipher = ciphers.TLS_CHACHA20_POLY1305_SHA256
             psk_wrapper = psk_wrappers[0]
-            cipher = TLSCipher(
+            self.cipher = TLSCipher(
                 psk_wrapper.client_early_traffic_secret(self.handshake_context)
             )
 
             inner_plaintext = ContentType.application_data.tls_inner_plaintext(
                 self.early_data
             )
-            self.packed_early_data = cipher.tls_ciphertext(inner_plaintext)
+            self.packed_early_data = self.cipher.tls_ciphertext(inner_plaintext)
+            print(self.packed_early_data)
 
     def resumption(self, data_callback=None):
         if self.session_tickets:
@@ -635,13 +620,15 @@ class TLSClientSession:
                 session_ticket.to_psk_identity(self.TLSCipher.tls_hash.hash_len)
                 for session_ticket in self.session_tickets
             ]
+            psk_only = bool(self.session_tickets[0].max_early_data_size)
         else:
             psk = self.psk
             psk_identities = None
+            psk_only = self.psk_only
         return TLSClientSession(
             self.server_names,
             psk=psk,
-            psk_only=self.psk_only,
+            psk_only=psk_only,
             psk_identities=psk_identities,
             data_callback=data_callback,
         )
@@ -782,6 +769,15 @@ class TLSClientSession:
                 if content_type == ContentType.handshake:
                     self.unpack_handshake(plaintext[:-1])
                     if self.server_finished:
+                        if self.early_data:
+                            eoe_data = HandshakeType.end_of_early_data.pack_data(b"")
+                            # self.handshake_context.extend(eoe_data)
+                            inner_plaintext = ContentType.handshake.tls_inner_plaintext(
+                                eoe_data
+                            )
+                            record = self.cipher.tls_ciphertext(inner_plaintext)
+                            yield from iofree.write(record)
+
                         # client handshake cipher
                         cipher = TLSCipher(client_handshake_traffic_secret)
                         client_finished = cipher.verify_data(self.handshake_context)

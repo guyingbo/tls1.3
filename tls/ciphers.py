@@ -1,7 +1,7 @@
 import abc
 import nacl.bindings
 from Crypto.Cipher import AES
-from key_schedule import tls_sha256, tls_sha384
+from .key_schedule import tls_sha256, tls_sha384
 
 
 class TLS_AEAD_Cipher(abc.ABC):
