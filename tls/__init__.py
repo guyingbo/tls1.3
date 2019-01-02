@@ -3,15 +3,23 @@ import time
 import struct
 import random
 import iofree
+import typing
 from dataclasses import dataclass
 from enum import IntEnum
 from types import SimpleNamespace
 from nacl.public import PrivateKey
 from nacl.bindings import crypto_scalarmult
+
+from Crypto.PublicKey import RSA
+from cryptography.hazmat.backends import default_backend
+
+# from cryptography import x509
+# from OpenSSL.crypto import load_certificate, FILETYPE_ASN1
 from . import ciphers
 from .key_schedule import PSKWrapper
 from .utils import pack_int, pack_list, pack_all
 
+backend = default_backend()
 MAX_LIFETIME = 24 * 3600 * 7
 AGE_MOD = 2 ** 32
 
@@ -24,7 +32,7 @@ class Alert(Exception):
 
 class MyIntEnum(IntEnum):
     @classmethod
-    def from_value(cls, value):
+    def from_value(cls, value: int):
         for e in cls:
             if e == value:
                 return e
@@ -117,7 +125,7 @@ class ExtensionType(UInt16Enum):
         )
 
     @classmethod
-    def unpack_from(cls, mv):
+    def unpack_from(cls, mv: memoryview):
         extensions = {}
         while mv:
             type_value = int.from_bytes(mv[:2], "big")
@@ -127,7 +135,7 @@ class ExtensionType(UInt16Enum):
                 pos = extension_data_lenth + 2
                 extension_data = mv[2:pos]
                 assert (
-                    len(extension_data) == extension_data_lenth
+                    extension_data.nbytes == extension_data_lenth
                 ), "extension length does not match"
                 mv = mv[pos:]
             else:
@@ -136,7 +144,7 @@ class ExtensionType(UInt16Enum):
             extensions[et] = et.unpack(extension_data)
         return extensions
 
-    def unpack(self, data):
+    def unpack(self, data: memoryview):
         if self == ExtensionType.supported_versions:
             return bytes(data)
         if self == ExtensionType.key_share:
@@ -252,7 +260,6 @@ class SignatureScheme(UInt16Enum):
     # private_use(0xFE00..0xFFFF)
 
 
-# backend = default_backend()
 dh_parameters = {
     # "ffdhe2048": dh.generate_parameters(generator=2, key_size=2048, backend=backend),
     # "ffdhe3072": dh.generate_parameters(generator=2, key_size=3072, backend=backend),
@@ -293,7 +300,7 @@ class NamedGroup(UInt16Enum):
         return private_key, cls.x25519.pack() + pack_int(2, key_exchange)
 
     @classmethod
-    def unpack_from(cls, data):
+    def unpack_from(cls, data: memoryview):
         value = int.from_bytes(data[:2], "big")
         group_type = cls.from_value(value)
         length = int.from_bytes(data[2:4], "big")
@@ -325,26 +332,37 @@ class CertificateEntry:
     __slots__ = ("cert_type", "cert_data", "extensions")
 
     @classmethod
-    def unpack_from(cls, data):
+    def unpack_from(cls, data: memoryview):
         certificate_request_context_len = data[0]
         certificate_request_context = data[1 : 1 + certificate_request_context_len]
         certificate_request_context
         data = data[1 + certificate_request_context_len :]
         certificate_list_len = int.from_bytes(data[:3], "big")
-        certificate_list = data[3 : 3 + certificate_list_len]
-        assert (
-            len(data[3 + certificate_list_len :]) == 0
+        certificate_list = data[3:]
+        assert certificate_list_len == len(
+            certificate_list
         ), "Certificate length does not match"
-        cert_type = CertificateType.from_value(certificate_list[0])
-        cert_data_len = int.from_bytes(certificate_list[1:4], "big")
-        cert_data = certificate_list[4 : 4 + cert_data_len]
-        extensions_data = certificate_list[4 + cert_data_len :]
-        extensions_len = int.from_bytes(extensions_data[:2], "big")
-        extensions = ExtensionType.unpack_from(extensions_data[2 : 2 + extensions_len])
-        assert (
-            len(extensions_data[2 + extensions_len :]) == 0
-        ), "extensions length does not match"
-        return cls(cert_type, cert_data, extensions)
+        certs = []
+        while certificate_list:
+            cert_data_len = int.from_bytes(certificate_list[:3], "big")
+            cert_data = certificate_list[3 : 3 + cert_data_len]
+            cert_type = 0
+            if cert_type == CertificateType.X509:
+                # x = x509.load_der_x509_certificate(data=cert_data, backend=backend)
+                # x = load_certificate(FILETYPE_ASN1, cert_data)
+                key = RSA.import_key(cert_data)
+                key
+            certificate_list = certificate_list[3 + cert_data_len :]
+            extensions_len = int.from_bytes(certificate_list[:2], "big")
+            assert extensions_len <= len(
+                certificate_list[2:]
+            ), "extensions length does not match"
+            extensions = ExtensionType.unpack_from(
+                certificate_list[2 : 2 + extensions_len]
+            )
+            certificate_list = certificate_list[2 + extensions_len :]
+            certs.append(cls(cert_type, cert_data, extensions))
+        return certs
 
 
 class KeyUpdateRequest(UInt8Enum):
@@ -380,7 +398,7 @@ class CipherSuite(UInt16Enum):
     @classmethod
     def select(cls, data):
         data = memoryview(data)
-        for i in (0, len(data), 2):
+        for i in (0, data.nbytes, 2):
             if data[i : i + 2] in cls.all():
                 return data[i : i + 2].tobytes()
 
@@ -460,7 +478,9 @@ class PskIdentity:
     binder_len: int
 
 
-def client_pre_shared_key_extension(psk_identities):
+def client_pre_shared_key_extension(
+    psk_identities: typing.Iterable
+) -> typing.Tuple[bytes, int]:
     binders = pack_psk_binder_entries((i.binder_len * b"\x00" for i in psk_identities))
     return (
         ExtensionType.pre_shared_key.pack_data(
@@ -477,11 +497,11 @@ def client_pre_shared_key_extension(psk_identities):
     )
 
 
-def pack_psk_binder_entries(binder_list):
+def pack_psk_binder_entries(binder_list: typing.Iterable[bytes]) -> bytes:
     return pack_list(2, (pack_int(1, binder) for binder in binder_list))
 
 
-def unpack_certificate_verify(mv):
+def unpack_certificate_verify(mv: memoryview):
     algorithm = int.from_bytes(mv[:2], "big")
     scheme = SignatureScheme.from_value(algorithm)
     signature_len = int.from_bytes(mv[2:4], "big")
@@ -489,7 +509,7 @@ def unpack_certificate_verify(mv):
     return SimpleNamespace(algorithm=scheme, signature=signature)
 
 
-def unpack_new_session_ticket(mv):
+def unpack_new_session_ticket(mv: memoryview):
     lifetime, age_add, nonce_len = struct.unpack_from("!IIB", mv)
     mv = mv[9:]
     nonce = mv[:nonce_len]
@@ -526,20 +546,20 @@ class NewSessionTicket:
     def is_outdated(self):
         return time.time() >= self.outdated_time
 
-    def to_psk_identity(self, binder_len):
+    def to_psk_identity(self, binder_len: int):
         return PskIdentity(self.ticket, self.obfuscated_ticket_age, binder_len)
 
 
 class TLSClientSession:
     def __init__(
         self,
-        server_names="",
-        psk=None,
-        psk_only=False,
-        psk_label=b"Client_identity",
+        server_names: typing.List[str] = "",
+        psk: typing.List[bytes] = None,
+        psk_only: bool = False,
+        psk_label: bytes = b"Client_identity",
         psk_identities=None,
-        data_callback=None,
-        early_data=None,
+        data_callback: typing.Callable = None,
+        early_data: bytes = None,
     ):
         if type(server_names) == str:
             server_names = [server_names]
@@ -608,7 +628,7 @@ class TLSClientSession:
             self.packed_early_data = self.cipher.tls_ciphertext(inner_plaintext)
             print(self.packed_early_data)
 
-    def resumption(self, data_callback=None):
+    def resumption(self, data_callback: typing.Callable = None):
         if self.session_tickets:
             psk = [
                 self.key_scheduler.resumption_psk(
@@ -634,7 +654,11 @@ class TLSClientSession:
         )
 
     def _pack_client_hello(
-        self, extensions, cipher_suites=None, compatibility_mode=True, retry=False
+        self,
+        extensions,
+        cipher_suites=None,
+        compatibility_mode: bool = True,
+        retry: bool = False,
     ):
         legacy_version = b"\x03\x03"
         if compatibility_mode:
@@ -675,7 +699,7 @@ class TLSClientSession:
         extension_length = int.from_bytes(mv[3:5], "big")
         extensions_mv = mv[5:]
         assert (
-            len(extensions_mv) == extension_length
+            extensions_mv.nbytes == extension_length
         ), "extensions length does not match"
         extensions = ExtensionType.unpack_from(extensions_mv)
         return SimpleNamespace(
@@ -710,6 +734,7 @@ class TLSClientSession:
         elif handshake_type == HandshakeType.certificate_verify:
             self.handshake_context.extend(mv)
             self.certificate_verify = unpack_certificate_verify(handshake_data)
+            print(self.certificate_verify)
         elif handshake_type == HandshakeType.finished:
             assert handshake_data == self.peer_cipher.verify_data(
                 self.handshake_context
@@ -824,11 +849,11 @@ class TLSClientSession:
         data = ContentType.handshake.tls_plaintext(self.client_hello_data)
         return data if not self.early_data else data + self.packed_early_data
 
-    def pack_application_data(self, payload: bytes):
+    def pack_application_data(self, payload: bytes) -> bytes:
         inner_plaintext = ContentType.application_data.tls_inner_plaintext(payload)
         return self.cipher.tls_ciphertext(inner_plaintext)
 
-    def pack_alert(self, description: AlertDescription, level: AlertLevel):
+    def pack_alert(self, description: AlertDescription, level: AlertLevel) -> bytes:
         payload = level.pack() + description.pack()
         if self.cipher:
             inner_plaintext = ContentType.alert.tls_inner_plaintext(payload)
@@ -836,16 +861,16 @@ class TLSClientSession:
         else:
             return ContentType.alert.tls_plaintext(payload)
 
-    def pack_warning(self, description: AlertDescription):
+    def pack_warning(self, description: AlertDescription) -> bytes:
         return self.pack_alert(description, AlertLevel.warning)
 
-    def pack_fatal(self, description: AlertDescription):
+    def pack_fatal(self, description: AlertDescription) -> bytes:
         return self.pack_alert(description, AlertLevel.fatal)
 
-    def pack_close(self):
+    def pack_close(self) -> bytes:
         return self.pack_warning(AlertDescription.close_notify)
 
-    def pack_canceled(self):
+    def pack_canceled(self) -> bytes:
         return self.pack_warning(AlertDescription.user_canceled)
 
     def parser(self):
