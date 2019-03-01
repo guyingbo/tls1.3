@@ -747,6 +747,7 @@ class TLSClientSession:
             raise Exception(f"unknown handshake type {handshake_type}")
 
     def tls_response(self):
+        parser = yield from iofree.get_parser()
         while True:
             head = yield from iofree.read(5)
             assert head[1:3] == b"\x03\x03", f"bad legacy_record_version {head[1:3]}"
@@ -754,7 +755,7 @@ class TLSClientSession:
             if (head[0] == ContentType.application_data and length > (16384 + 256)) or (
                 head[0] != ContentType.application_data and length > 16384
             ):
-                yield from iofree.write(
+                parser.write(
                     self.pack_fatal(AlertDescription.record_overflow)
                 )
                 raise Alert(AlertLevel.fatal, AlertDescription.record_overflow)
@@ -801,7 +802,7 @@ class TLSClientSession:
                                 eoe_data
                             )
                             record = self.cipher.tls_ciphertext(inner_plaintext)
-                            yield from iofree.write(record)
+                            parser.write(record)
 
                         # client handshake cipher
                         cipher = TLSCipher(client_handshake_traffic_secret)
@@ -816,7 +817,7 @@ class TLSClientSession:
                         change_cipher_spec = ContentType.change_cipher_spec.tls_plaintext(
                             b"\x01"
                         )
-                        yield from iofree.write(change_cipher_spec + record)
+                        parser.write(change_cipher_spec + record)
                         # server application cipher
                         server_secret = key_scheduler.server_application_traffic_secret_0(
                             self.handshake_context
