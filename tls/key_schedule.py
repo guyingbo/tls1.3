@@ -127,6 +127,11 @@ class KeyScheduler:
             self.master_secret, b"s ap traffic", messages
         )
 
+    def application_traffic_secret_N(self, last_secret) -> bytes:
+        return self.tls_hash.hkdf_expand_label(
+            last_secret, b"traffic upd", b"", self.tls_hash.hash_len
+        )
+
     def exporter_master_secret(self, messages) -> bytes:
         return self.tls_hash.derive_secret(self.master_secret, b"exp master", messages)
 
