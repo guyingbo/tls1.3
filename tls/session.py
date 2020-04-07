@@ -2,36 +2,19 @@ import os
 from . import models
 import iofree
 import typing
-from enum import IntEnum
 from nacl.public import PrivateKey
 from nacl.bindings import crypto_scalarmult
-
-from cryptography.hazmat.backends import default_backend
-
-# from cryptography import x509
-# from OpenSSL.crypto import load_certificate, FILETYPE_ASN1
 from . import ciphers
 from .key_schedule import PSKWrapper
 
-backend = default_backend()
+# from cryptography.hazmat.backends import default_backend
+# from cryptography import x509
+# from OpenSSL.crypto import load_certificate, FILETYPE_ASN1
+# backend = default_backend()
 
 
-class EventType(IntEnum):
-    should_send = 0
-    should_receive = 1
-    should_close = 3
-    received = 4
-    connected = 5
-
-
-class Event:
-    def __init__(self, event_type: EventType, **kwargs):
-        self.event_type = event_type
-        for k, v in kwargs.items():
-            setattr(self, k, v)
-
-    def __str__(self):
-        return f"{self.__class__.__name__}({self.event_type!r})"
+class ProtocolError(Exception):
+    ""
 
 
 def new_x25519():
@@ -61,8 +44,7 @@ class TLSClientSession:
         self.psk_list = isinstance(psk, (list, tuple)) and psk or [psk]
         self.psk_identities = psk_identities
         self.psk_label = psk_label
-        self._parser = iofree.Parser(self._server_response())
-        self.events = []
+        self._parser = iofree.Parser(self._client())
 
     def client_hello(self):
         extensions = [
@@ -153,24 +135,8 @@ class TLSClientSession:
         data = models.ContentType.handshake.tls_plaintext(self.client_hello_data)
         return self.early_data and data + self.packed_early_data or data
 
-    def wait_server_hello(self, data: bytes):
-        self._parser.send(data)
-        return self.get_events()
-
-    def get_events(self):
-        events = self.events
-        self.events = []
-        return events
-
-    def _new_event(self, event_type: EventType, **kwargs):
-        self.events.append(Event(event_type, **kwargs))
-
     def send(self, data: bytes) -> bytes:
         return self.pack_application_data(data)
-
-    def recv(self, data):
-        self._parser.send(data)
-        return self._parser.read_output()
 
     def close(self):
         return self.pack_close()
@@ -224,41 +190,46 @@ class TLSClientSession:
         to_send.extend(record)
         return bytes(to_send)
 
-    def _server_response(self):
+    def _client(self):
+        parser = yield from iofree.get_parser()
+        parser.respond(data=self.client_hello())
+        plain_text = yield from models.TLSPlaintext.get_value()
+        assert plain_text.content_type is models.ContentType.handshake
+        self.peer_handshake = models.Handshake.parse(plain_text.fragment)
+        self.handshake_context.extend(plain_text.fragment)
+        print("plaintext handshake:", self.peer_handshake.msg_type)
+        server_hello = self.peer_handshake.msg
+        peer_pk = server_hello.extensions_dict[
+            models.ExtensionType.key_share
+        ].key_exchange
+        shared_key = crypto_scalarmult(bytes(self.private_key), peer_pk)
+        self.TLSCipher = server_hello.get_cipher()
+        key_index = server_hello.extensions_dict.get(
+            models.ExtensionType.pre_shared_key
+        )
+        psk = None if key_index is None else self.psk_list[key_index]
+        self.key_scheduler = self.TLSCipher.tls_hash.scheduler(shared_key, psk)
+        secret = self.key_scheduler.server_handshake_traffic_secret(
+            self.handshake_context
+        )
+        # server handshake cipher
+        self.peer_cipher = self.TLSCipher(secret)
+        self.client_handshake_traffic_secret = self.key_scheduler.client_handshake_traffic_secret(
+            self.handshake_context
+        )
+        plain_text = yield from models.TLSPlaintext.get_value()
+        assert plain_text.content_type is models.ContentType.change_cipher_spec
+        print("plaintext:", plain_text.content_type)
         while True:
             plain_text = yield from models.TLSPlaintext.get_value()
             if plain_text.is_overflow():
-                self._new_event(
-                    EventType.should_send,
+                parser.respond(
                     data=self.pack_fatal(models.AlertDescription.record_overflow),
+                    close=True,
+                    exc=ProtocolError("text overflow"),
                 )
-                self._new_event(EventType.should_close)
-            if plain_text.content_type is models.ContentType.handshake:
-                self.peer_handshake = models.Handshake.parse(plain_text.fragment)
-                self.handshake_context.extend(plain_text.fragment)
-                print("plaintext handshake:", self.peer_handshake.msg_type)
-                server_hello = self.peer_handshake.msg
-                peer_pk = server_hello.extensions_dict[
-                    models.ExtensionType.key_share
-                ].key_exchange
-                shared_key = crypto_scalarmult(bytes(self.private_key), peer_pk)
-                self.TLSCipher = server_hello.get_cipher()
-                key_index = server_hello.extensions_dict.get(
-                    models.ExtensionType.pre_shared_key
-                )
-                psk = None if key_index is None else self.psk_list[key_index]
-                self.key_scheduler = self.TLSCipher.tls_hash.scheduler(shared_key, psk)
-                secret = self.key_scheduler.server_handshake_traffic_secret(
-                    self.handshake_context
-                )
-                # server handshake cipher
-                self.peer_cipher = self.TLSCipher(secret)
-                self.client_handshake_traffic_secret = self.key_scheduler.client_handshake_traffic_secret(
-                    self.handshake_context
-                )
-            elif plain_text.content_type is models.ContentType.change_cipher_spec:
-                print("plaintext:", plain_text.content_type)
-            elif plain_text.content_type is models.ContentType.application_data:
+                return
+            if plain_text.content_type is models.ContentType.application_data:
                 content = self.peer_cipher.decrypt(
                     plain_text.fragment, plain_text.binary[:5]
                 )  # .rstrip(b"\x00")
@@ -283,12 +254,11 @@ class TLSClientSession:
                             self.handshake_context
                         )
                         self.peer_cipher = self.TLSCipher(self.server_secret)
-                        self._new_event(EventType.connected)
-                        self._parser.set_result(None)
+                        parser.respond(data=self.client_finish(), result=True)
+                        print("connected")
                         self.server_finished = False
                 elif inner_text.content_type is models.ContentType.application_data:
-                    yield from iofree.write(inner_text.content)
-                    self._new_event(EventType.received, data=inner_text.content)
+                    parser.respond(result=inner_text.content)
                 else:
                     print(inner_text)
             elif plain_text.content_type is models.ContentType.alert:

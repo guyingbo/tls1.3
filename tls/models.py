@@ -150,9 +150,6 @@ class CipherSuite(enum.IntEnum):
     TLS_AES_128_CCM_8_SHA256 = 0x1305
 
 
-cipher_suite = schema.SizedIntEnum(schema.uint16be, CipherSuite)
-
-
 class ContentType(enum.IntEnum):
     invalid = 0
     change_cipher_spec = 20
@@ -162,43 +159,6 @@ class ContentType(enum.IntEnum):
 
     def tls_plaintext(self, payload):
         return TLSPlaintext.pack(self, payload)
-
-
-class TLSPlaintext(schema.BinarySchema):
-    content_type = schema.SizedIntEnum(schema.uint8, ContentType)
-    legacy_record_version = schema.Bytes(2)
-    fragment = schema.LengthPrefixedBytes(schema.uint16be)
-
-    @classmethod
-    def pack(cls, content_type: ContentType, data: bytes) -> bytes:
-        assert len(data) > 0, "need data"
-        data = memoryview(data)
-        fragments = []
-        while True:
-            if len(data) > 16384:
-                fragments.append(data[:16384])
-                data = data[16384:]
-            else:
-                fragments.append(data)
-                break
-        is_handshake = content_type is ContentType.handshake
-        return b"".join(
-            cls(
-                content_type,
-                b"\x03\x01" if i == 0 and is_handshake else b"\x03\x03",
-                bytes(frg),
-            ).binary
-            for i, frg in enumerate(fragments)
-        )
-
-    def is_overflow(self):
-        return (
-            self.content_type is ContentType.application_data
-            and len(self.fragment) > (16384 + 256)
-        ) or (
-            self.content_type is not ContentType.application_data
-            and len(self.fragment) > 16384
-        )
 
 
 class TLSCiphertext(schema.BinarySchema):
@@ -331,7 +291,9 @@ class ClientHello(schema.BinarySchema):
     legacy_version = schema.MustEqual(schema.Bytes(2), b"\x03\x03")
     rand = schema.Bytes(32)
     legacy_session_id = schema.LengthPrefixedBytes(schema.uint8)
-    cipher_suites = schema.LengthPrefixedObjectList(schema.uint16be, cipher_suite)
+    cipher_suites = schema.LengthPrefixedObjectList(
+        schema.uint16be, schema.SizedIntEnum(schema.uint16be, CipherSuite)
+    )
     legacy_compression_methods = schema.MustEqual(schema.Bytes(2), b"\x01\x00")
     extensions = schema.LengthPrefixedObjectList(schema.uint16be, ClientExtension)
 
@@ -340,7 +302,7 @@ class ServerHello(schema.BinarySchema):
     legacy_version = schema.MustEqual(schema.Bytes(2), b"\x03\x03")
     rand = schema.Bytes(32)
     legacy_session_id_echo = schema.LengthPrefixedBytes(schema.uint8)
-    cipher_suite = cipher_suite
+    cipher_suite = schema.SizedIntEnum(schema.uint16be, CipherSuite)
     legacy_compression_method = schema.MustEqual(schema.uint8, 0)
     extensions = schema.LengthPrefixedObjectList(schema.uint16be, ServerExtension)
 
@@ -434,6 +396,56 @@ class Handshake(schema.BinarySchema):
 class Alert(schema.BinarySchema):
     level = schema.SizedIntEnum(schema.uint8, AlertLevel)
     description = schema.SizedIntEnum(schema.uint8, AlertDescription)
+
+
+conten_type_cases = {
+    ContentType.handshake: Handshake,
+    ContentType.application_data: schema.Bytes(-1),
+    ContentType.alert: Alert,
+    ContentType.change_cipher_spec: schema.MustEqual(schema.Bytes(1), b"\x01"),
+}
+
+
+class TLSPlaintext(schema.BinarySchema):
+    content_type = schema.SizedIntEnum(schema.uint8, ContentType)
+    legacy_record_version = schema.Bytes(2)
+    fragment = schema.LengthPrefixedBytes(schema.uint16be)
+
+    # @classmethod
+    # def get_handshake(cls, content_type: ContentType):
+    #     plaintext = yield from cls.get_value()
+    #     return Handshake.parse(plaintext.fragment)
+
+    @classmethod
+    def pack(cls, content_type: ContentType, data: bytes) -> bytes:
+        assert len(data) > 0, "need data"
+        data = memoryview(data)
+        fragments = []
+        while True:
+            if len(data) > 16384:
+                fragments.append(data[:16384])
+                data = data[16384:]
+            else:
+                fragments.append(data)
+                break
+        is_handshake = content_type is ContentType.handshake
+        return b"".join(
+            cls(
+                content_type,
+                b"\x03\x01" if i == 0 and is_handshake else b"\x03\x03",
+                bytes(frg),
+            ).binary
+            for i, frg in enumerate(fragments)
+        )
+
+    def is_overflow(self):
+        return (
+            self.content_type is ContentType.application_data
+            and len(self.fragment) > (16384 + 256)
+        ) or (
+            self.content_type is not ContentType.application_data
+            and len(self.fragment) > 16384
+        )
 
 
 class TLSInnerPlaintext(schema.BinarySchema):
