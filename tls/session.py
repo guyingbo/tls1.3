@@ -220,6 +220,31 @@ class TLSClientSession:
         plain_text = yield from models.TLSPlaintext.get_value()
         assert plain_text.content_type is models.ContentType.change_cipher_spec
         print("plaintext:", plain_text.content_type)
+        server_finished = False
+        while not server_finished:
+            plain_text = yield from models.TLSPlaintext.get_value()
+            assert plain_text.content_type is models.ContentType.application_data
+            content = self.peer_cipher.decrypt(
+                plain_text.fragment, plain_text.binary[:5]
+            )
+            inner_text = models.TLSInnerPlaintext.parse(content)
+            assert inner_text.content_type is models.ContentType.handshake
+            handshake = models.Handshake.parse(inner_text.content)
+            print("inner_text:", handshake.msg_type)
+            if handshake.msg_type is models.HandshakeType.finished:
+                assert handshake.msg == self.peer_cipher.verify_data(
+                    self.handshake_context
+                ), "server handshake finished does not match"
+                server_finished = True
+            self.handshake_context.extend(inner_text.content)
+        # server application cipher
+        self.server_secret = self.key_scheduler.server_application_traffic_secret_0(
+            self.handshake_context
+        )
+        self.peer_cipher = self.TLSCipher(self.server_secret)
+        parser.respond(data=self.client_finish(), result=True)
+        print("connected")
+
         while True:
             plain_text = yield from models.TLSPlaintext.get_value()
             if plain_text.is_overflow():
@@ -242,21 +267,7 @@ class TLSClientSession:
                             self.server_secret
                         )
                         self.peer_cipher = self.TLSCipher(self.server_secret)
-                    if handshake.msg_type is models.HandshakeType.finished:
-                        assert handshake.msg == self.peer_cipher.verify_data(
-                            self.handshake_context
-                        ), "server handshake finished does not match"
-                        self.server_finished = True
                     self.handshake_context.extend(inner_text.content)
-                    if self.server_finished:
-                        # server application cipher
-                        self.server_secret = self.key_scheduler.server_application_traffic_secret_0(
-                            self.handshake_context
-                        )
-                        self.peer_cipher = self.TLSCipher(self.server_secret)
-                        parser.respond(data=self.client_finish(), result=True)
-                        print("connected")
-                        self.server_finished = False
                 elif inner_text.content_type is models.ContentType.application_data:
                     parser.respond(result=inner_text.content)
                 else:

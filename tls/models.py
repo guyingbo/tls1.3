@@ -156,6 +156,7 @@ class ContentType(enum.IntEnum):
     alert = 21
     handshake = 22
     application_data = 23
+    heartbeat = 24
 
     def tls_plaintext(self, payload):
         return TLSPlaintext.pack(self, payload)
